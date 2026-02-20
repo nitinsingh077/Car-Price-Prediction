@@ -1,5 +1,6 @@
 // Centralized data store for car data and model state
-import type { CarData, ScalingParams, ModelMetrics } from './ml-model';
+// Uses Supabase for persistence with in-memory fallback
+import type { CarData, ScalingParams, ModelMetrics } from "./ml-model";
 import {
   parseCSV,
   preprocessData,
@@ -10,9 +11,10 @@ import {
   trainTestSplit,
   getFeatureImportance,
   getDataStatistics,
-} from './ml-model';
+} from "./ml-model";
+import { createAdminClient } from "./supabase/admin";
 
-// Car data CSV (embedded for server-side processing)
+// Car data CSV (embedded for fallback/seeding)
 export const carDataCSV = `Car_Name,Year,Selling_Price,Present_Price,Driven_kms,Fuel_Type,Selling_type,Transmission,Owner
 ritz,2014,3.35,5.59,27000,Petrol,Dealer,Manual,0
 sx4,2013,4.75,9.54,43000,Diesel,Dealer,Manual,0
@@ -316,6 +318,299 @@ city,2009,3.35,11,87934,Petrol,Dealer,Manual,0
 city,2017,11.5,12.5,9000,Diesel,Dealer,Manual,0
 brio,2016,5.3,5.9,5464,Petrol,Dealer,Manual,0`;
 
+// ============================================================
+// Supabase Database Integration Layer
+// ============================================================
+
+// Check if Supabase is available
+function isSupabaseConfigured(): boolean {
+  return !!(
+    process.env.NEXT_PUBLIC_SUPABASE_URL &&
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+}
+
+// Get Supabase admin client (safe - returns null if not configured)
+function getSupabaseAdmin() {
+  try {
+    if (!isSupabaseConfigured()) return null;
+    return createAdminClient();
+  } catch {
+    return null;
+  }
+}
+
+// Initialize Supabase tables and seed data
+export async function initializeDatabase(): Promise<{
+  success: boolean;
+  message: string;
+  seeded?: number;
+}> {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) {
+    return { success: false, message: "Supabase not configured" };
+  }
+
+  try {
+    // Create car_data table via RPC (raw SQL)
+    const { error: createError } = await supabase.rpc("exec_sql", {
+      sql_query: `
+        CREATE TABLE IF NOT EXISTS public.car_data (
+          id BIGSERIAL PRIMARY KEY,
+          car_name TEXT NOT NULL,
+          year INTEGER NOT NULL,
+          selling_price NUMERIC(10,2) NOT NULL,
+          present_price NUMERIC(10,2) NOT NULL,
+          driven_kms INTEGER NOT NULL,
+          fuel_type TEXT NOT NULL,
+          selling_type TEXT NOT NULL,
+          transmission TEXT NOT NULL,
+          owner INTEGER NOT NULL DEFAULT 0,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        
+        CREATE TABLE IF NOT EXISTS public.prediction_history (
+          id TEXT PRIMARY KEY,
+          input_year INTEGER NOT NULL,
+          input_present_price NUMERIC(10,2) NOT NULL,
+          input_driven_kms INTEGER NOT NULL,
+          input_fuel_type TEXT NOT NULL,
+          input_seller_type TEXT NOT NULL,
+          input_transmission TEXT NOT NULL,
+          input_owner INTEGER NOT NULL DEFAULT 0,
+          predicted_price NUMERIC(10,2) NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        
+        CREATE TABLE IF NOT EXISTS public.model_state (
+          id INTEGER PRIMARY KEY DEFAULT 1,
+          weights JSONB NOT NULL,
+          scaling_params JSONB NOT NULL,
+          train_metrics JSONB NOT NULL,
+          test_metrics JSONB NOT NULL,
+          feature_importance JSONB NOT NULL,
+          statistics JSONB NOT NULL,
+          version TEXT NOT NULL,
+          trained_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+      `,
+    });
+
+    // If RPC doesn't exist, tables may already exist - try inserting data directly
+    if (createError) {
+      console.log(
+        "RPC not available, attempting direct table operations:",
+        createError.message,
+      );
+    }
+
+    // Check if car_data has data
+    const { count } = await supabase
+      .from("car_data")
+      .select("*", { count: "exact", head: true });
+
+    if (count === 0 || count === null) {
+      // Seed the data
+      const csvData = parseCSV(carDataCSV);
+      const rows = csvData.map((car) => ({
+        car_name: car.Car_Name,
+        year: car.Year,
+        selling_price: car.Selling_Price,
+        present_price: car.Present_Price,
+        driven_kms: car.Driven_kms,
+        fuel_type: car.Fuel_Type,
+        selling_type: car.Selling_type,
+        transmission: car.Transmission,
+        owner: car.Owner,
+      }));
+
+      // Insert in batches of 50
+      let seeded = 0;
+      for (let i = 0; i < rows.length; i += 50) {
+        const batch = rows.slice(i, i + 50);
+        const { error: insertError } = await supabase
+          .from("car_data")
+          .insert(batch);
+        if (insertError) {
+          console.error("Seed batch error:", insertError.message);
+        } else {
+          seeded += batch.length;
+        }
+      }
+
+      return {
+        success: true,
+        message: `Database initialized and seeded with ${seeded} records`,
+        seeded,
+      };
+    }
+
+    return {
+      success: true,
+      message: `Database already has ${count} records`,
+      seeded: 0,
+    };
+  } catch (error) {
+    console.error("DB init error:", error);
+    return {
+      success: false,
+      message: `Database initialization failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+    };
+  }
+}
+
+// Fetch car data from Supabase
+export async function fetchCarDataFromSupabase(): Promise<CarData[] | null> {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return null;
+
+  try {
+    const { data, error } = await supabase
+      .from("car_data")
+      .select("*")
+      .order("id", { ascending: true });
+
+    if (error || !data || data.length === 0) return null;
+
+    return data.map((row: Record<string, unknown>) => ({
+      Car_Name: row.car_name as string,
+      Year: row.year as number,
+      Selling_Price: Number(row.selling_price),
+      Present_Price: Number(row.present_price),
+      Driven_kms: row.driven_kms as number,
+      Fuel_Type: row.fuel_type as string,
+      Selling_type: row.selling_type as string,
+      Transmission: row.transmission as string,
+      Owner: row.owner as number,
+    }));
+  } catch {
+    return null;
+  }
+}
+
+// Save prediction to Supabase
+export async function savePredictionToSupabase(record: {
+  id: string;
+  input: {
+    year: number;
+    presentPrice: number;
+    drivenKms: number;
+    fuelType: string;
+    sellerType: string;
+    transmission: string;
+    owner: number;
+  };
+  predictedPrice: number;
+}): Promise<boolean> {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return false;
+
+  try {
+    const { error } = await supabase.from("prediction_history").insert({
+      id: record.id,
+      input_year: record.input.year,
+      input_present_price: record.input.presentPrice,
+      input_driven_kms: record.input.drivenKms,
+      input_fuel_type: record.input.fuelType,
+      input_seller_type: record.input.sellerType,
+      input_transmission: record.input.transmission,
+      input_owner: record.input.owner,
+      predicted_price: record.predictedPrice,
+    });
+
+    return !error;
+  } catch {
+    return false;
+  }
+}
+
+// Fetch prediction history from Supabase
+export async function fetchHistoryFromSupabase(): Promise<
+  PredictionRecord[] | null
+> {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return null;
+
+  try {
+    const { data, error } = await supabase
+      .from("prediction_history")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(100);
+
+    if (error || !data) return null;
+
+    return data.map((row: Record<string, unknown>) => ({
+      id: row.id as string,
+      input: {
+        year: row.input_year as number,
+        presentPrice: Number(row.input_present_price),
+        drivenKms: row.input_driven_kms as number,
+        fuelType: row.input_fuel_type as string,
+        sellerType: row.input_seller_type as string,
+        transmission: row.input_transmission as string,
+        owner: row.input_owner as number,
+      },
+      predictedPrice: Number(row.predicted_price),
+      timestamp: (row.created_at as string) || new Date().toISOString(),
+    }));
+  } catch {
+    return null;
+  }
+}
+
+// Save model state to Supabase
+export async function saveModelToSupabase(model: ModelState): Promise<boolean> {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return false;
+
+  try {
+    const { error } = await supabase.from("model_state").upsert({
+      id: 1,
+      weights: model.weights,
+      scaling_params: model.scalingParams,
+      train_metrics: model.metrics.train,
+      test_metrics: model.metrics.test,
+      feature_importance: model.featureImportance,
+      statistics: model.statistics,
+      version: model.version,
+      trained_at: model.trainedAt,
+    });
+
+    return !error;
+  } catch {
+    return false;
+  }
+}
+
+// Add car data to Supabase
+export async function addCarDataToSupabase(car: CarData): Promise<boolean> {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return false;
+
+  try {
+    const { error } = await supabase.from("car_data").insert({
+      car_name: car.Car_Name,
+      year: car.Year,
+      selling_price: car.Selling_Price,
+      present_price: car.Present_Price,
+      driven_kms: car.Driven_kms,
+      fuel_type: car.Fuel_Type,
+      selling_type: car.Selling_type,
+      transmission: car.Transmission,
+      owner: car.Owner,
+    });
+
+    return !error;
+  } catch {
+    return false;
+  }
+}
+
+// ============================================================
+// In-Memory Store (Fallback + Primary Cache)
+// ============================================================
+
 // Model state interface
 export interface ModelState {
   weights: number[];
@@ -336,23 +631,42 @@ let cachedModel: ModelState | null = null;
 // Additional car data storage (for user-added data)
 let additionalCarData: CarData[] = [];
 
-// Get all car data (original + additional)
+// Track if Supabase data was loaded
+let supabaseDataLoaded = false;
+
+// Get all car data (try Supabase first, then fallback to CSV)
 export function getAllCarData(): CarData[] {
   const originalData = parseCSV(carDataCSV);
   return [...originalData, ...additionalCarData];
 }
 
+// Async version that tries Supabase
+export async function getAllCarDataAsync(): Promise<CarData[]> {
+  if (!supabaseDataLoaded) {
+    const supabaseData = await fetchCarDataFromSupabase();
+    if (supabaseData && supabaseData.length > 0) {
+      supabaseDataLoaded = true;
+      return supabaseData;
+    }
+  }
+  return getAllCarData();
+}
+
 // Add new car data
-export function addCarData(car: CarData): void {
+export async function addCarData(car: CarData): Promise<void> {
   additionalCarData.push(car);
-  // Invalidate cached model to force retraining
   cachedModel = null;
+  // Also persist to Supabase
+  await addCarDataToSupabase(car);
 }
 
 // Add multiple car records
-export function addCarDataBatch(cars: CarData[]): void {
+export async function addCarDataBatch(cars: CarData[]): Promise<void> {
   additionalCarData.push(...cars);
   cachedModel = null;
+  for (const car of cars) {
+    await addCarDataToSupabase(car);
+  }
 }
 
 // Get additional car data count
@@ -367,36 +681,33 @@ export function clearAdditionalData(): void {
 }
 
 // Train model and cache results
-export function getOrTrainModel(forceRetrain: boolean = false): ModelState {
+export function getOrTrainModel(forceRetrain = false): ModelState {
   if (cachedModel && !forceRetrain) return cachedModel;
-  
+
   const data = getAllCarData();
   const { features, targets } = preprocessData(data);
   const { scaledFeatures, scalingParams } = standardizeFeatures(features);
-  
+
   // Split data (80% train, 20% test)
-  const { trainFeatures, testFeatures, trainTargets, testTargets } = trainTestSplit(
-    scaledFeatures,
-    targets,
-    0.2
-  );
-  
+  const { trainFeatures, testFeatures, trainTargets, testTargets } =
+    trainTestSplit(scaledFeatures, targets, 0.2);
+
   // Train model using Multiple Linear Regression with Ridge regularization
   const weights = trainLinearRegression(trainFeatures, trainTargets);
-  
+
   // Calculate metrics on both train and test sets
   const trainPredictions = predictBatch(trainFeatures, weights);
   const testPredictions = predictBatch(testFeatures, weights);
-  
+
   const trainMetrics = calculateMetrics(trainTargets, trainPredictions);
   const testMetrics = calculateMetrics(testTargets, testPredictions);
-  
+
   // Get feature importance (absolute coefficient values)
   const featureImportance = getFeatureImportance(weights);
-  
+
   // Get data statistics
   const statistics = getDataStatistics(data);
-  
+
   cachedModel = {
     weights,
     scalingParams,
@@ -406,7 +717,10 @@ export function getOrTrainModel(forceRetrain: boolean = false): ModelState {
     trainedAt: new Date().toISOString(),
     version: `v${Date.now()}`,
   };
-  
+
+  // Persist model to Supabase (fire and forget)
+  saveModelToSupabase(cachedModel).catch(() => {});
+
   return cachedModel;
 }
 
@@ -443,7 +757,9 @@ interface PredictionRecord {
 
 let predictionHistory: PredictionRecord[] = [];
 
-export function addPredictionToHistory(record: Omit<PredictionRecord, 'id' | 'timestamp'>): PredictionRecord {
+export function addPredictionToHistory(
+  record: Omit<PredictionRecord, "id" | "timestamp">,
+): PredictionRecord {
   const newRecord: PredictionRecord = {
     ...record,
     id: `pred_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -454,13 +770,59 @@ export function addPredictionToHistory(record: Omit<PredictionRecord, 'id' | 'ti
   if (predictionHistory.length > 100) {
     predictionHistory = predictionHistory.slice(0, 100);
   }
+
+  // Also persist to Supabase (fire and forget)
+  savePredictionToSupabase(newRecord).catch(() => {});
+
   return newRecord;
 }
 
-export function getPredictionHistory(): PredictionRecord[] {
+export async function getPredictionHistory(): Promise<PredictionRecord[]> {
+  // Try Supabase first
+  const supabaseHistory = await fetchHistoryFromSupabase();
+  if (supabaseHistory && supabaseHistory.length > 0) {
+    return supabaseHistory;
+  }
+  return predictionHistory;
+}
+
+export function getPredictionHistorySync(): PredictionRecord[] {
   return predictionHistory;
 }
 
 export function clearPredictionHistory(): void {
   predictionHistory = [];
+}
+
+// Get database status
+export async function getDatabaseStatus(): Promise<{
+  supabaseConnected: boolean;
+  supabaseRecords: number | null;
+  inMemoryRecords: number;
+  modelTrained: boolean;
+}> {
+  let supabaseConnected = false;
+  let supabaseRecords: number | null = null;
+
+  const supabase = getSupabaseAdmin();
+  if (supabase) {
+    try {
+      const { count, error } = await supabase
+        .from("car_data")
+        .select("*", { count: "exact", head: true });
+      if (!error) {
+        supabaseConnected = true;
+        supabaseRecords = count;
+      }
+    } catch {
+      // Supabase not available
+    }
+  }
+
+  return {
+    supabaseConnected,
+    supabaseRecords,
+    inMemoryRecords: getAllCarData().length,
+    modelTrained: isModelTrained(),
+  };
 }
