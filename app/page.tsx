@@ -6,6 +6,7 @@ import { PredictionForm } from "@/components/prediction-form";
 import { PredictionResult } from "@/components/prediction-result";
 import { StatsCards } from "@/components/stats-cards";
 import { ModelCharts } from "@/components/model-charts";
+import { DbStatus } from "@/components/db-status";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -263,6 +264,9 @@ export default function Home() {
                   </div>
                 </CardContent>
               </Card>
+
+              {/* Database Status */}
+              <DbStatus />
 
               {/* Model Performance */}
               <Card className="border-border bg-card lg:col-span-2">

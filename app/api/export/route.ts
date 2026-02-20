@@ -1,22 +1,36 @@
-import { NextResponse } from 'next/server';
-import { getAllCarData, getOrTrainModel, getPredictionHistory } from '@/lib/data-store';
+import { NextResponse } from "next/server";
+import {
+  getAllCarData,
+  getOrTrainModel,
+  getPredictionHistory,
+} from "@/lib/data-store";
 
 // GET /api/export - Export data in various formats
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
-    const format = searchParams.get('format') || 'json';
-    const type = searchParams.get('type') || 'data';
-    
+    const format = searchParams.get("format") || "json";
+    const type = searchParams.get("type") || "data";
+
     // Export car data
-    if (type === 'data') {
+    if (type === "data") {
       const data = getAllCarData();
-      
-      if (format === 'csv') {
-        const headers = ['Car_Name', 'Year', 'Selling_Price', 'Present_Price', 'Driven_kms', 'Fuel_Type', 'Selling_type', 'Transmission', 'Owner'];
+
+      if (format === "csv") {
+        const headers = [
+          "Car_Name",
+          "Year",
+          "Selling_Price",
+          "Present_Price",
+          "Driven_kms",
+          "Fuel_Type",
+          "Selling_type",
+          "Transmission",
+          "Owner",
+        ];
         const csvRows = [
-          headers.join(','),
-          ...data.map(car => 
+          headers.join(","),
+          ...data.map((car) =>
             [
               car.Car_Name,
               car.Year,
@@ -27,18 +41,18 @@ export async function GET(request: Request) {
               car.Selling_type,
               car.Transmission,
               car.Owner,
-            ].join(',')
+            ].join(","),
           ),
         ];
-        
-        return new NextResponse(csvRows.join('\n'), {
+
+        return new NextResponse(csvRows.join("\n"), {
           headers: {
-            'Content-Type': 'text/csv',
-            'Content-Disposition': 'attachment; filename=car_data.csv',
+            "Content-Type": "text/csv",
+            "Content-Disposition": "attachment; filename=car_data.csv",
           },
         });
       }
-      
+
       return NextResponse.json({
         success: true,
         data,
@@ -46,11 +60,11 @@ export async function GET(request: Request) {
         totalRecords: data.length,
       });
     }
-    
+
     // Export model info
-    if (type === 'model') {
+    if (type === "model") {
       const model = getOrTrainModel();
-      
+
       const modelExport = {
         version: model.version,
         trainedAt: model.trainedAt,
@@ -60,38 +74,50 @@ export async function GET(request: Request) {
         weights: model.weights,
         scalingParams: model.scalingParams,
       };
-      
-      if (format === 'csv') {
-        // Export feature importance as CSV
+
+      if (format === "csv") {
         const csvRows = [
-          'Feature,Importance',
-          ...model.featureImportance.map(fi => `${fi.feature},${fi.importance}`),
+          "Feature,Importance",
+          ...model.featureImportance.map(
+            (fi) => `${fi.feature},${fi.importance}`,
+          ),
         ];
-        
-        return new NextResponse(csvRows.join('\n'), {
+
+        return new NextResponse(csvRows.join("\n"), {
           headers: {
-            'Content-Type': 'text/csv',
-            'Content-Disposition': 'attachment; filename=model_info.csv',
+            "Content-Type": "text/csv",
+            "Content-Disposition": "attachment; filename=model_info.csv",
           },
         });
       }
-      
+
       return NextResponse.json({
         success: true,
         model: modelExport,
         exportedAt: new Date().toISOString(),
       });
     }
-    
+
     // Export prediction history
-    if (type === 'history') {
-      const history = getPredictionHistory();
-      
-      if (format === 'csv') {
-        const headers = ['ID', 'Timestamp', 'Year', 'Present_Price', 'Driven_kms', 'Fuel_Type', 'Seller_Type', 'Transmission', 'Owner', 'Predicted_Price'];
+    if (type === "history") {
+      const history = await getPredictionHistory();
+
+      if (format === "csv") {
+        const headers = [
+          "ID",
+          "Timestamp",
+          "Year",
+          "Present_Price",
+          "Driven_kms",
+          "Fuel_Type",
+          "Seller_Type",
+          "Transmission",
+          "Owner",
+          "Predicted_Price",
+        ];
         const csvRows = [
-          headers.join(','),
-          ...history.map(h => 
+          headers.join(","),
+          ...history.map((h) =>
             [
               h.id,
               h.timestamp,
@@ -103,18 +129,19 @@ export async function GET(request: Request) {
               h.input.transmission,
               h.input.owner,
               h.predictedPrice.toFixed(2),
-            ].join(',')
+            ].join(","),
           ),
         ];
-        
-        return new NextResponse(csvRows.join('\n'), {
+
+        return new NextResponse(csvRows.join("\n"), {
           headers: {
-            'Content-Type': 'text/csv',
-            'Content-Disposition': 'attachment; filename=prediction_history.csv',
+            "Content-Type": "text/csv",
+            "Content-Disposition":
+              "attachment; filename=prediction_history.csv",
           },
         });
       }
-      
+
       return NextResponse.json({
         success: true,
         history,
@@ -122,13 +149,13 @@ export async function GET(request: Request) {
         totalRecords: history.length,
       });
     }
-    
+
     // Export all
-    if (type === 'all') {
+    if (type === "all") {
       const data = getAllCarData();
       const model = getOrTrainModel();
-      const history = getPredictionHistory();
-      
+      const history = await getPredictionHistory();
+
       return NextResponse.json({
         success: true,
         exportedAt: new Date().toISOString(),
@@ -149,16 +176,19 @@ export async function GET(request: Request) {
         },
       });
     }
-    
+
     return NextResponse.json(
-      { success: false, error: 'Invalid type. Use "data", "model", "history", or "all"' },
-      { status: 400 }
+      {
+        success: false,
+        error: 'Invalid type. Use "data", "model", "history", or "all"',
+      },
+      { status: 400 },
     );
   } catch (error) {
-    console.error('Export error:', error);
+    console.error("Export error:", error);
     return NextResponse.json(
-      { success: false, error: 'Failed to export data' },
-      { status: 500 }
+      { success: false, error: "Failed to export data" },
+      { status: 500 },
     );
   }
 }
